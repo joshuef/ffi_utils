@@ -13,6 +13,7 @@ use crate::ffi_result;
 use std::fmt::{Debug, Display};
 use std::os::raw::c_void;
 use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
 
 /// Catches panics and returns the result.
 pub fn catch_unwind_result<'a, F, T, E>(f: F) -> Result<T, E>
@@ -26,6 +27,18 @@ where
     }
 }
 
+/// Catches panics and returns the result from an async func.
+pub async fn async_catch_unwind_result<'a, F, T, E>(f: F) -> Pin<Box<Result<T, E>>>
+where
+    F: FnOnce() -> Pin<Box<Result<T, E>>> + Send + Sync + 'static,
+    E: Debug + From<&'a str>,
+{
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Err(_) => Box::pin(Err(E::from("panic"))),
+        Ok(result) => result,
+    }
+}
+
 /// Catch panics. On error call the callback.
 pub fn catch_unwind_cb<'a, U, C, F, E>(user_data: U, cb: C, f: F)
 where
@@ -35,6 +48,36 @@ where
     E: Debug + Display + ErrorCode + From<&'a str>,
 {
     if let Err(err) = catch_unwind_result(f) {
+        let (error_code, description) = ffi_result!(Err::<(), E>(err));
+        let res = NativeResult {
+            error_code,
+            description: Some(description),
+        }
+        .into_repr_c();
+
+        match res {
+            Ok(res) => cb.call(user_data.into(), &res, CallbackArgs::default()),
+            Err(_) => {
+                let res = FfiResult {
+                    error_code,
+                    description: b"Could not convert error description into CString\x00"
+                        as *const u8 as *const _,
+                };
+                cb.call(user_data.into(), &res, CallbackArgs::default());
+            }
+        }
+    }
+}
+
+/// Catch panics in sync func. On error call the callback.
+pub async fn async_catch_unwind_cb<'a, U, C, F, E>(user_data: U, cb: C, f: F)
+where
+    U: Into<*mut c_void>,
+    C: Callback + Copy,
+    F: FnOnce() -> Pin<Box<Result<T, E>>> + Send + Sync + 'static,
+    E: Debug + Display + ErrorCode + From<&'a str>,
+{
+    if let Err(err) = async_catch_unwind_result(f).await {
         let (error_code, description) = ffi_result!(Err::<(), E>(err));
         let res = NativeResult {
             error_code,
